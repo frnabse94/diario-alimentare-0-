@@ -3,81 +3,169 @@
 <head>
   <meta charset="utf-8">
   <title>Diario alimentare</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    body{font-family:sans-serif;max-width:480px;margin:40px auto}
-    textarea{width:100%;height:80px}
-    button{margin-top:8px;padding:8px 16px}
-    #entry{display:none}
+    body { font-family: sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px; }
+    h2 { margin-top: 24px; }
+    input, textarea, button { font-size: 1rem; }
+    input, textarea { width: 100%; box-sizing: border-box; }
+    textarea { height: 80px; }
+    button { margin-top: 8px; padding: 8px 16px; }
+    #entry, #mic, #diary { display: none; margin-top: 16px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+    th, td { border: 1px solid #ccc; padding: 4px 8px; text-align: left; }
   </style>
+
+  <!-- Supabase client -->
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <!-- Transformers.js + ONNX Runtime Web per NER alimentare -->
+  <script src="https://cdn.jsdelivr.net/npm/@xenova/transformers@1.3.0/dist/transformers.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.15.2/dist/ort.min.js"></script>
 </head>
 <body>
 
-<h2 id="title">Accedi</h2>
-<input id="email" type="email" placeholder="la tua email">
-<button id="send">Invia link magico</button>
+  <h2 id="title">Accedi</h2>
 
-<div id="entry">
-  <h2>Nuovo pasto</h2>
-  <textarea id="text"></textarea><br>
-  Sintomo (0‑10): <input id="symptom" type="number" min="0" max="10" value="0"><br>
-  <button id="save">Salva</button>
-  <p id="msg"></p>
-</div>
+  <!-- Login email -->
+  <input id="email" type="email" placeholder="La tua email">
+  <button id="send">Invia link magico</button>
+
+  <!-- Form per nuovo pasto -->
+  <div id="entry">
+    <h2>Nuovo pasto</h2>
+    <textarea id="text" placeholder="Detta o scrivi qui il tuo pasto"></textarea>
+    <br>
+    Sintomo (0-10): <input id="symptom" type="number" min="0" max="10" value="0">
+    <br>
+    <button id="save">Salva</button>
+    <p id="msg"></p>
+  </div>
+
+  <!-- Pulsante dettatura -->
+  <button id="mic">🎙 Dettatura pasto</button>
+
+  <!-- Tabella del diario -->
+  <h2 id="diaryTitle" style="display:none;">Il tuo Diario</h2>
+  <table id="diary">
+    <thead>
+      <tr>
+        <th>Data/Ora</th>
+        <th>Raw text</th>
+        <th>Alimenti</th>
+        <th>Sintomo</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
 
 <script>
-/* === CONFIG === */
+/* === CONFIG: sostituisci qui === */
 const SUPABASE_URL  = "https://vudebxhcimscxgvtzdbh.supabase.co";
 const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZ1ZGVieGhjaW1zY3hndnR6ZGJoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDYxOTczNjcsImV4cCI6MjA2MTc3MzM2N30.RvMIOdZuiK0RHIOYpNUwvR-QmGkduTK01Q-IuHLCMag";
-/* ============== */
+/* ============================== */
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON);
+let ner;  // modello NER
 
-// 1. se arrivo col ?code=... faccio exchange
-(async ()=> {
+// Inizializza il modello NER in background
+(async()=>{
+  ner = await window.transformers.pipeline(
+    "token-classification",
+    "Dizex/InstaFoodRoBERTa-NER",
+    { quantized: true }
+  );
+})();
+
+// Funzione per mostrare il form e la tabella
+function showUI() {
+  document.getElementById("title").innerText = "Benvenuto!";
+  document.getElementById("send").style.display = "none";
+  document.getElementById("email").style.display = "none";
+  document.getElementById("entry").style.display = "block";
+  document.getElementById("mic").style.display = "inline-block";
+  document.getElementById("diaryTitle").style.display = "block";
+  document.getElementById("diary").style.display = "table";
+}
+
+// Aggiunge una riga alla tabella
+function addRow(entry) {
+  const tr = document.createElement("tr");
+  tr.insertCell().innerText = new Date(entry.created_at).toLocaleString();
+  tr.insertCell().innerText = entry.raw_text;
+  tr.insertCell().innerText = (entry.foods || []).join(", ");
+  tr.insertCell().innerText = entry.symptom;
+  document.querySelector("#diary tbody").appendChild(tr);
+}
+
+// Rileva login esistente o scambio code→session
+(async()=>{
   const url = new URL(window.location.href);
-  if (url.searchParams.get('code')) {
-    const { error } = await sb.auth.exchangeCodeForSession(window.location.href);
-    if (!error) showForm();      // login OK
-    url.search = "";             // pulisco la barra indirizzi
+  if (url.searchParams.get("code")) {
+    await sb.auth.exchangeCodeForSession(window.location.href);
+    url.search = "";
     history.replaceState({}, "", url);
-  } else {
-    // già loggato?
-    const { data: { session } } = await sb.auth.getSession();
-    if (session) showForm();
+  }
+  const { data: { session } } = await sb.auth.getSession();
+  if (session) {
+    showUI();
+    // Carica dati iniziali
+    const { data } = await sb
+      .from("diary_entries")
+      .select("*")
+      .eq("user_id", session.user.id)
+      .order("created_at", { ascending: false });
+    data.forEach(addRow);
+    // Sottoscrizione realtime
+    sb.from(`diary_entries:user_id=eq.${session.user.id}`)
+      .on("INSERT", payload => addRow(payload.new))
+      .subscribe();
   }
 })();
 
-// 2. invio magic‑link
-document.getElementById('send').onclick = async ()=>{
-  const email = document.getElementById('email').value.trim();
-  if(!email) return alert("Inserisci l'email");
-  const redirect = window.location.origin;           // <<—
+// Invio magic link
+document.getElementById("send").onclick = async () => {
+  const email = document.getElementById("email").value.trim();
+  if (!email) return alert("Inserisci l'email");
   const { error } = await sb.auth.signInWithOtp({
-      email,
-      options:{ emailRedirectTo: redirect }
+    email,
+    options: { emailRedirectTo: window.location.origin }
   });
   alert(error ? error.message : "Controlla la posta e clicca il link");
 };
 
-// 3. salva record
-document.getElementById('save').onclick = async ()=>{
-  const text = document.getElementById('text').value.trim();
-  const sym  = parseInt(document.getElementById('symptom').value,10);
-  if(!text) return alert("Scrivi il pasto");
-  const { data:{user} } = await sb.auth.getUser();
-  const { error } = await sb.from('diary_entries').insert({
-      user_id:user.id, raw_text:text, symptom:sym
+// Salvataggio del pasto con parsing AI
+document.getElementById("save").onclick = async () => {
+  const text = document.getElementById("text").value.trim();
+  const sym  = parseInt(document.getElementById("symptom").value, 10);
+  if (!text) return alert("Scrivi il pasto");
+  // Esegui NER per estrarre alimenti
+  const entities = await ner(text);
+  const foods = entities
+    .filter(e => e.entity.endsWith("FOOD"))
+    .map(e => e.word);
+  const { data: { user } } = await sb.auth.getUser();
+  const { error } = await sb.from("diary_entries").insert({
+    user_id: user.id,
+    raw_text: text,
+    foods,
+    symptom: sym
   });
-  document.getElementById('msg').textContent = error?error.message:"Salvato!";
+  document.getElementById("msg").innerText = error ? error.message : "Salvato!";
 };
 
-function showForm(){
-  document.getElementById('title').innerText="Benvenuto!";
-  document.getElementById('entry').style.display="block";
-  document.getElementById('send').style.display="none";
-  document.getElementById('email').style.display="none";
-}
+// Microfono per dettatura
+document.getElementById("mic").onclick = () => {
+  if (!("webkitSpeechRecognition" in window)) {
+    return alert("Dettatura non supportata in questo browser");
+  }
+  const r = new webkitSpeechRecognition();
+  r.lang = "it-IT";
+  r.onresult = e => {
+    document.getElementById("text").value = e.results[0][0].transcript;
+  };
+  r.start();
+};
 </script>
+
 </body>
 </html>
